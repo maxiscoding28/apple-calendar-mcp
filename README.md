@@ -1,9 +1,17 @@
 # apple-calendar-mcp
 
-A local, self-contained MCP server giving Claude Desktop full CRUD over the
-macOS Calendar via **EventKit** — including real recurring-event operations.
+A local [MCP](https://modelcontextprotocol.io) server that gives Claude full
+CRUD access to the **macOS Calendar** via Apple's **EventKit** framework —
+including real recurring-event operations.
 
-No cloud, no external services. Your calendar data never leaves the Mac.
+Everything runs on your Mac. No cloud, no accounts, no external services — your
+calendar data never leaves the machine.
+
+## Requirements
+
+- **macOS** (uses EventKit / the native Calendar database)
+- **Python 3.10+** (the MCP SDK requires it)
+- An MCP client — these instructions cover **Claude Desktop**
 
 ## Tools
 
@@ -24,10 +32,7 @@ No cloud, no external services. Your calendar data never leaves the Mac.
 > their calendar's color. So coloring happens at the calendar level; there's no
 > event-color tool because EventKit exposes no such property.
 
-See [DEMO.md](DEMO.md) for a copy-paste prompt that exercises every tool on a
-self-cleaning scratch calendar.
-
-### Recurring events
+### Working with recurring events
 
 `list_events` returns each occurrence with its `event_id` **and** its own
 `start`. To act on a specific occurrence, pass that `start` back as
@@ -37,14 +42,14 @@ self-cleaning scratch calendar.
 - `future` — that occurrence and every later one
 - `all` — the entire series
 
-Change the recurrence rule by passing a new `recurrence` spec to
-`update_event`; turn a series into a one-off with `clear_recurrence=True`.
+Change how an event recurs by passing a new `recurrence` spec to `update_event`;
+turn a series into a one-off with `clear_recurrence=True`.
 
 Recurrence spec shape:
 
 ```json
 {
-  "frequency": "weekly",           // daily | weekly | monthly | yearly
+  "frequency": "weekly",            // daily | weekly | monthly | yearly
   "interval": 2,                    // every N periods
   "days_of_week": ["MO","WE","FR"], // weekly only
   "days_of_month": [1, -1],         // monthly only (-1 = last day)
@@ -53,32 +58,72 @@ Recurrence spec shape:
 }
 ```
 
-## Install / rebuild
+## Install
 
 ```bash
-cd /Users/maxwinslow/Code/apple-calendar-mcp
-/opt/homebrew/bin/python3.14 -m venv .venv
+git clone https://github.com/maxiscoding28/apple-calendar-mcp.git
+cd apple-calendar-mcp
+python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Requires Python 3.10+ (uses 3.14 here — the system 3.9 is too old for the MCP SDK).
+Use any Python 3.10+ interpreter to create the venv. If your default `python3`
+is older, substitute a newer one (e.g. `python3.12 -m venv .venv`).
 
-## Claude Desktop wiring
+## Connect to Claude Desktop
 
-Already registered in `~/Library/Application Support/Claude/claude_desktop_config.json`:
+Add the server to your `claude_desktop_config.json`. You can open it from
+Claude Desktop via **Settings → Developer → Edit Config**, or find it at:
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
+Add an `apple-calendar` entry under `mcpServers`, using **absolute paths** to the
+Python interpreter in your venv and to `server.py`:
 
 ```json
-"apple-calendar": {
-  "command": "/Users/maxwinslow/Code/apple-calendar-mcp/.venv/bin/python",
-  "args": ["/Users/maxwinslow/Code/apple-calendar-mcp/server.py"]
+{
+  "mcpServers": {
+    "apple-calendar": {
+      "command": "/absolute/path/to/apple-calendar-mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/apple-calendar-mcp/server.py"]
+    }
+  }
 }
 ```
 
+Replace `/absolute/path/to/apple-calendar-mcp` with wherever you cloned the repo
+(run `pwd` in the project directory to get it). Then **fully quit and reopen
+Claude Desktop** so it picks up the change.
+
 ## Permissions (the one gotcha)
 
-On first use, macOS shows a **"Claude wants to access Calendar"** prompt —
-approve it. The grant is tied to Claude.app (the app launching the server).
+The first time a tool runs, macOS shows a **"Claude wants to access Calendar"**
+prompt — approve it. The grant is tied to the app that launches the server
+(Claude Desktop), not to Python.
 
 If it was denied, re-enable it under
-**System Settings → Privacy & Security → Calendars → Claude**, then fully quit
-and reopen Claude Desktop.
+**System Settings → Privacy & Security → Calendars**, enable your MCP client,
+then fully quit and reopen it.
+
+## Try it
+
+Ask Claude things like:
+
+- "What's on my calendar this week?"
+- "Move my 3pm Friday meeting to 4pm and add a location."
+- "Create a standup every weekday at 9am for the next two weeks."
+- "Delete just next Tuesday's occurrence of that standup."
+
+See [DEMO.md](DEMO.md) for a copy-paste prompt that exercises every tool on a
+self-cleaning scratch calendar — safe to run against a real account.
+
+## How it works
+
+`server.py` is a single-file [FastMCP](https://modelcontextprotocol.io) server
+that talks to EventKit through [PyObjC](https://pyobjc.readthedocs.io). It speaks
+MCP over stdio, so any stdio-capable MCP client can use it — Claude Desktop is
+just the documented example.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
