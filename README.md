@@ -9,13 +9,23 @@ No cloud, no external services. Your calendar data never leaves the Mac.
 
 | Tool | What it does |
 |------|--------------|
-| `list_calendars` | All calendars: id, title, source, writable, default |
+| `list_calendars` | All calendars: id, title, source, color, writable, default |
 | `list_events` | Events in a date range, recurring events expanded to occurrences |
 | `get_event` | Full detail for one event / occurrence |
 | `create_event` | New event, optionally recurring |
 | `update_event` | Change any field; retarget/reshape recurrence |
 | `delete_event` | Delete one occurrence, "this and future", or the whole series |
 | `detach_occurrence` | Make a standalone, non-recurring copy off a recurring series |
+| `create_calendar` | New calendar in a chosen source, optional color |
+| `set_calendar_color` | Recolor a calendar (hex, e.g. `#FF3B30`) |
+| `delete_calendar` | Permanently delete a calendar + its events (guarded, id-only) |
+
+> **Note on colors:** Apple Calendar has no per-*event* color — events inherit
+> their calendar's color. So coloring happens at the calendar level; there's no
+> event-color tool because EventKit exposes no such property.
+
+See [DEMO.md](DEMO.md) for a copy-paste prompt that exercises every tool on a
+self-cleaning scratch calendar.
 
 ### Recurring events
 

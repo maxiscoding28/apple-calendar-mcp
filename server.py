@@ -23,6 +23,7 @@ from Foundation import (
     NSRunLoop,
     NSDefaultRunLoopMode,
 )
+from AppKit import NSColor, NSColorSpace
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("apple-calendar")
@@ -209,6 +210,102 @@ def _resolve_calendar(calendar_id: Optional[str]):
     raise ValueError(f"Calendar not found: {calendar_id!r}")
 
 
+def _calendar_by_id(calendar_id: str):
+    """Strict lookup by calendar identifier only (no title fuzzy-match).
+    Used for destructive/color ops so a title can't accidentally match."""
+    for c in _store.calendarsForEntityType_(EK_ENTITY_EVENT):
+        if c.calendarIdentifier() == calendar_id:
+            return c
+    raise ValueError(f"No calendar with id {calendar_id!r}")
+
+
+# EKSourceType: local=0, exchange=1, caldav(iCloud)=2, mobileme=3, subscribed=4, birthdays=5
+def _resolve_source(source_hint: Optional[str]):
+    sources = list(_store.sources() or [])
+    if source_hint:
+        for s in sources:
+            if s.title() == source_hint:
+                return s
+        raise ValueError(
+            f"Source {source_hint!r} not found. Available: "
+            f"{[s.title() for s in sources]}"
+        )
+    # default: the source that owns the default calendar
+    dc = _store.defaultCalendarForNewEvents()
+    if dc is not None and dc.source() is not None:
+        return dc.source()
+    for wanted in (2, 0):  # prefer iCloud (CalDAV), then Local
+        for s in sources:
+            if s.sourceType() == wanted:
+                return s
+    if sources:
+        return sources[0]
+    raise RuntimeError("No calendar source available to create a calendar in.")
+
+
+def _nscolor_from_hex(value: str):
+    h = value.strip().lstrip("#")
+    if len(h) != 6:
+        raise ValueError(f"color must be a hex string like '#FF3B30', got {value!r}")
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, 1.0)
+
+
+def _hex_from_calendar(cal) -> Optional[str]:  # noqa: ANN001
+    ns = None
+    try:
+        ns = cal.color()
+    except Exception:
+        ns = None
+    if ns is None:
+        try:
+            cg = cal.CGColor()
+            if cg is not None:
+                ns = NSColor.colorWithCGColor_(cg)
+        except Exception:
+            ns = None
+    if ns is None:
+        return None
+    rgb = ns.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+    if rgb is None:
+        return None
+    return "#%02X%02X%02X" % (
+        round(rgb.redComponent() * 255),
+        round(rgb.greenComponent() * 255),
+        round(rgb.blueComponent() * 255),
+    )
+
+
+def _set_calendar_color(cal, value: str) -> None:  # noqa: ANN001
+    nscolor = _nscolor_from_hex(value)
+    try:
+        cal.setColor_(nscolor)
+    except Exception:
+        cal.setCGColor_(nscolor.CGColor())
+
+
+def _serialize_calendar(cal) -> dict:  # noqa: ANN001
+    default = _store.defaultCalendarForNewEvents()
+    default_id = default.calendarIdentifier() if default else None
+    return {
+        "calendar_id": cal.calendarIdentifier(),
+        "title": cal.title(),
+        "source": cal.source().title() if cal.source() else None,
+        "color": _hex_from_calendar(cal),
+        "writable": bool(cal.allowsContentModifications()),
+        "is_default": cal.calendarIdentifier() == default_id,
+    }
+
+
+def _save_calendar(cal) -> None:  # noqa: ANN001
+    ok, err = _store.saveCalendar_commit_error_(cal, True, None)
+    if not ok:
+        raise RuntimeError(
+            f"Calendar save failed: "
+            f"{err.localizedDescription() if err else 'unknown error'}"
+        )
+
+
 def _find_occurrence(event_id: str, occurrence_start: str):
     target = _parse_dt(occurrence_start).timestamp()
     lo = NSDate.dateWithTimeIntervalSince1970_(target - 86400)
@@ -308,20 +405,71 @@ def _apply_fields(e, title, start, end, all_day, location, notes, url):  # noqa:
 
 @mcp.tool()
 def list_calendars() -> list:
-    """List all calendars, with their id, title, source, and whether they're writable."""
+    """List all calendars, with their id, title, source, color (hex), whether
+    they're writable, and which is the default."""
     _ensure_access()
-    default = _store.defaultCalendarForNewEvents()
-    default_id = default.calendarIdentifier() if default else None
-    out = []
-    for c in _store.calendarsForEntityType_(EK_ENTITY_EVENT):
-        out.append({
-            "calendar_id": c.calendarIdentifier(),
-            "title": c.title(),
-            "source": c.source().title() if c.source() else None,
-            "writable": bool(c.allowsContentModifications()),
-            "is_default": c.calendarIdentifier() == default_id,
-        })
-    return out
+    return [
+        _serialize_calendar(c)
+        for c in _store.calendarsForEntityType_(EK_ENTITY_EVENT)
+    ]
+
+
+@mcp.tool()
+def create_calendar(
+    title: str,
+    color: Optional[str] = None,
+    source: Optional[str] = None,
+) -> dict:
+    """Create a new calendar and return it.
+
+    Args:
+        title: Name for the new calendar.
+        color: Optional hex color, e.g. '#FF3B30'.
+        source: Optional account/source title to create it in (e.g. 'iCloud',
+            'On My Mac'). Default: the source of your default calendar. Use
+            list_calendars to see which sources exist.
+    """
+    _ensure_access()
+    cal = EventKit.EKCalendar.calendarForEntityType_eventStore_(EK_ENTITY_EVENT, _store)
+    cal.setTitle_(title)
+    cal.setSource_(_resolve_source(source))
+    if color:
+        _set_calendar_color(cal, color)
+    _save_calendar(cal)
+    return _serialize_calendar(cal)
+
+
+@mcp.tool()
+def set_calendar_color(calendar_id: str, color: str) -> dict:
+    """Set a calendar's color. `color` is a hex string like '#34C759'.
+    Requires the calendar's id (from list_calendars), not its title."""
+    _ensure_access()
+    cal = _calendar_by_id(calendar_id)
+    if not cal.allowsContentModifications():
+        raise ValueError("That calendar is read-only/subscribed; its color can't be changed.")
+    _set_calendar_color(cal, color)
+    _save_calendar(cal)
+    return _serialize_calendar(cal)
+
+
+@mcp.tool()
+def delete_calendar(calendar_id: str) -> dict:
+    """Permanently delete a calendar AND all events in it. Irreversible.
+
+    Requires the calendar's exact id (from list_calendars), never a title, so it
+    can't fire on a fuzzy match. Refuses read-only/subscribed calendars.
+    """
+    _ensure_access()
+    cal = _calendar_by_id(calendar_id)
+    if not cal.allowsContentModifications():
+        raise ValueError("Refusing to delete a read-only/subscribed calendar.")
+    title = cal.title()
+    ok, err = _store.removeCalendar_commit_error_(cal, True, None)
+    if not ok:
+        raise RuntimeError(
+            f"Delete failed: {err.localizedDescription() if err else 'unknown error'}"
+        )
+    return {"deleted": True, "calendar_id": calendar_id, "title": title}
 
 
 @mcp.tool()
