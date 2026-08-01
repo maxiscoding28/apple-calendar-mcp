@@ -1,487 +1,475 @@
 #!/usr/bin/env python3
 """
-Apple Calendar MCP server (CalDAV backend).
+Apple Calendar MCP server.
 
-Full CRUD over an iCloud calendar account via CalDAV, exposing the same MCP tool
-surface as the original EventKit version (identical tool names + parameters).
+A local, self-contained MCP server that gives Claude full CRUD access to the
+macOS Calendar via EventKit — including real recurring-event operations
+(modify the recurrence rule, delete a single occurrence vs. the whole series,
+detach a standalone copy off a recurring series).
 
-Two transports, selected by MCP_TRANSPORT:
-  * http  (default) - long-running HTTP/streamable service, authenticated by
-                      Tailscale device identity (see TailscaleAuthASGI).
-  * stdio           - classic per-session stdio server for local MCP clients.
-
-The CalDAV backend is used in BOTH modes.
-
-Environment:
-  ICLOUD_USERNAME       Apple ID email.
-  ICLOUD_APP_PASSWORD   iCloud app-specific password (appleid.apple.com).
-  MCP_TRANSPORT         'http' (default) or 'stdio'.
-  MCP_HOST              HTTP bind host (default 0.0.0.0).
-  MCP_PORT              HTTP port (default 8420).
-  CALENDAR_TZ           IANA tz for naive datetimes (default: system /etc/localtime).
-  DEFAULT_CALENDAR      Name or URL of the calendar used when none is specified.
-  TS_ALLOWED            Comma-separated allowlist of Tailscale hostnames/logins.
-  TS_ALLOWLIST_FILE     File with one allowed identity per line (alt to TS_ALLOWED).
-  TAILSCALE_SOCKET      tailscaled LocalAPI socket (default /var/run/tailscale/tailscaled.sock).
+Runs over stdio for Claude Desktop.
 """
 
 from __future__ import annotations
 
-import http.client
-import json
-import logging
-import os
-import socket
-import uuid
-from datetime import date, datetime, time, timedelta, timezone
+import time
+from datetime import datetime
 from typing import Any, Optional
-from zoneinfo import ZoneInfo
 
-from icalendar import Calendar as ICalendar
-from icalendar import Event as IEvent
-from icalendar import vRecur
+import EventKit
+from Foundation import (
+    NSURL,
+    NSDate,
+    NSRunLoop,
+    NSDefaultRunLoopMode,
+)
+from AppKit import NSColor, NSColorSpace
 from mcp.server.fastmcp import FastMCP
-
-log = logging.getLogger("apple-calendar-mcp")
 
 mcp = FastMCP("apple-calendar")
 
 # ---------------------------------------------------------------------------
-# Config
+# EventKit store + access
 # ---------------------------------------------------------------------------
 
-MCP_TRANSPORT = os.environ.get("MCP_TRANSPORT", "http").lower()
-MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.environ.get("MCP_PORT", "8420"))
-TAILSCALE_SOCKET = os.environ.get(
-    "TAILSCALE_SOCKET", "/var/run/tailscale/tailscaled.sock"
-)
-# Trust same-machine (loopback) callers without a Tailscale WhoIs lookup. Use this
-# for local dev on your Mac before Tailscale is in the picture. Loopback is only
-# reachable from processes on this machine, so it's a sound local trust boundary.
-ALLOW_LOOPBACK = os.environ.get("ALLOW_LOOPBACK", "").lower() in ("1", "true", "yes")
-_LOOPBACK_IPS = {"127.0.0.1", "::1", "localhost"}
+_store = EventKit.EKEventStore.alloc().init()
+
+EK_ENTITY_EVENT = EventKit.EKEntityTypeEvent
+EK_SPAN_THIS = EventKit.EKSpanThisEvent
+EK_SPAN_FUTURE = EventKit.EKSpanFutureEvents
+
+# EKAuthorizationStatus values
+_ST_NOT_DETERMINED = 0
+_ST_RESTRICTED = 1
+_ST_DENIED = 2
+_ST_FULL = 3          # authorized / full access
+_ST_WRITE_ONLY = 4
 
 
-def _local_tz() -> ZoneInfo:
-    name = os.environ.get("CALENDAR_TZ")
-    if name:
-        return ZoneInfo(name)
-    try:
-        link = os.readlink("/etc/localtime")
-        if "zoneinfo/" in link:
-            return ZoneInfo(link.split("zoneinfo/", 1)[1])
-    except OSError:
-        pass
-    return ZoneInfo("UTC")
+def _request_full_access() -> bool:
+    """Trigger the TCC prompt and block (spinning the run loop) until it resolves."""
+    result: dict[str, Any] = {"done": False, "granted": False}
 
+    def handler(granted, error):  # noqa: ANN001
+        result["granted"] = bool(granted)
+        result["done"] = True
 
-_LOCAL_TZ = _local_tz()
+    if hasattr(_store, "requestFullAccessToEventsWithCompletion_"):
+        _store.requestFullAccessToEventsWithCompletion_(handler)
+    else:  # pragma: no cover - very old macOS
+        _store.requestAccessToEntityType_completion_(EK_ENTITY_EVENT, handler)
 
-
-# ---------------------------------------------------------------------------
-# CalDAV connection (lazy so pure helpers import without caldav/creds)
-# ---------------------------------------------------------------------------
-
-_state: dict[str, Any] = {"client": None, "principal": None, "calendars": None}
-
-
-def _principal():
-    if _state["principal"] is None:
-        user = os.environ.get("ICLOUD_USERNAME")
-        pw = os.environ.get("ICLOUD_APP_PASSWORD")
-        if not user or not pw:
-            raise RuntimeError(
-                "Set ICLOUD_USERNAME and ICLOUD_APP_PASSWORD (an iCloud "
-                "app-specific password from appleid.apple.com)."
-            )
-        import caldav
-
-        client = caldav.DAVClient(
-            url="https://caldav.icloud.com", username=user, password=pw
+    runloop = NSRunLoop.currentRunLoop()
+    deadline = time.time() + 60
+    while not result["done"] and time.time() < deadline:
+        runloop.runMode_beforeDate_(
+            NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.1)
         )
-        _state["client"] = client
-        _state["principal"] = client.principal()
-    return _state["principal"]
+    return result["granted"]
 
 
-def _calendars(refresh: bool = False) -> list:
-    if _state["calendars"] is None or refresh:
-        _state["calendars"] = list(_principal().calendars())
-    return _state["calendars"]
-
-
-def _cal_name(cal) -> Optional[str]:  # noqa: ANN001
-    try:
-        n = cal.get_display_name()
-        if n:
-            return str(n)
-    except Exception:
-        pass
-    return str(cal.name) if getattr(cal, "name", None) else None
-
-
-def _norm_color(value) -> Optional[str]:  # noqa: ANN001
-    if not value:
-        return None
-    s = str(value).strip()
-    if s.startswith("#") and len(s) == 9:  # #RRGGBBAA -> drop alpha
-        s = s[:7]
-    return s.upper() if s.startswith("#") else s
-
-
-def _cal_color(cal) -> Optional[str]:  # noqa: ANN001
-    try:
-        from caldav.elements import ical
-
-        return _norm_color(cal.get_property(ical.CalendarColor()))
-    except Exception:
-        return None
-
-
-def _set_cal_color(cal, hex_value: str) -> None:  # noqa: ANN001
-    if not (hex_value.startswith("#") and len(hex_value) in (7, 9)):
-        raise ValueError(f"color must be hex like '#FF3B30', got {hex_value!r}")
-    from caldav.elements import ical
-
-    cal.set_properties([ical.CalendarColor(hex_value)])
-
-
-def _default_cal_url() -> Optional[str]:
-    hint = os.environ.get("DEFAULT_CALENDAR")
-    cals = _calendars()
-    if hint:
-        for c in cals:
-            if str(c.url).rstrip("/") == hint.rstrip("/") or _cal_name(c) == hint:
-                return str(c.url)
-    for c in cals:
-        if (_cal_name(c) or "").lower() in ("home", "calendar"):
-            return str(c.url)
-    return str(cals[0].url) if cals else None
-
-
-def _serialize_calendar(cal) -> dict:  # noqa: ANN001
-    return {
-        "calendar_id": str(cal.url),
-        "title": _cal_name(cal),
-        "source": os.environ.get("ICLOUD_USERNAME") or "iCloud",
-        "color": _cal_color(cal),
-        "writable": True,
-        "is_default": str(cal.url) == _default_cal_url(),
-    }
-
-
-def _resolve_calendar(calendar_id: Optional[str]):
-    if not calendar_id:
-        url = _default_cal_url()
-        if not url:
-            raise RuntimeError("No calendars available; cannot pick a default.")
-        return _calendar_by_url(url)
-    return _calendar_by_url(calendar_id)
-
-
-def _calendar_by_url(cid: str):
-    for cal in _calendars():
-        if str(cal.url).rstrip("/") == cid.rstrip("/") or _cal_name(cal) == cid:
-            return cal
-    _calendars(refresh=True)
-    for cal in _calendars():
-        if str(cal.url).rstrip("/") == cid.rstrip("/") or _cal_name(cal) == cid:
-            return cal
-    raise ValueError(f"Calendar not found: {cid!r}")
-
-
-def _calendar_by_id_strict(cid: str):
-    """URL-only match for destructive/color ops (no title fuzzy-match)."""
-    for cal in _calendars(refresh=True):
-        if str(cal.url).rstrip("/") == cid.rstrip("/"):
-            return cal
-    raise ValueError(f"No calendar with id {cid!r}")
+def _ensure_access() -> None:
+    status = EventKit.EKEventStore.authorizationStatusForEntityType_(EK_ENTITY_EVENT)
+    if status == _ST_FULL:
+        return
+    if status in (_ST_RESTRICTED, _ST_DENIED):
+        raise RuntimeError(
+            "Calendar access is denied. Grant it in "
+            "System Settings > Privacy & Security > Calendars, enable the app that "
+            "launched this server (Claude), then restart it."
+        )
+    # not determined or write-only -> request full access
+    if not _request_full_access():
+        raise RuntimeError(
+            "Calendar access was not granted. Approve the Calendar prompt, or enable "
+            "it in System Settings > Privacy & Security > Calendars."
+        )
 
 
 # ---------------------------------------------------------------------------
-# Date + recurrence translation
+# Date helpers
 # ---------------------------------------------------------------------------
 
 def _parse_dt(value: str) -> datetime:
+    """Parse an ISO-8601-ish local datetime. Accepts 'YYYY-MM-DD',
+    'YYYY-MM-DDTHH:MM', 'YYYY-MM-DD HH:MM[:SS]'. Naive => local time."""
     s = value.strip().replace("Z", "")
     if "T" not in s and " " in s:
         s = s.replace(" ", "T", 1)
-    if "T" not in s:
+    if "T" not in s:  # date only
         s = s + "T00:00:00"
     return datetime.fromisoformat(s)
 
 
-def _localize(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=_LOCAL_TZ) if dt.tzinfo is None else dt
+def _to_nsdate(value: str) -> NSDate:
+    return NSDate.dateWithTimeIntervalSince1970_(_parse_dt(value).timestamp())
 
 
-def _is_date_only(value: str) -> bool:
-    v = value.strip()
-    return "T" not in v and " " not in v and len(v) <= 10
-
-
-def _fmt(dt) -> Optional[str]:  # noqa: ANN001
-    if isinstance(dt, datetime):
-        return dt.isoformat()
-    if isinstance(dt, date):
-        return dt.isoformat()
-    return None
-
-
-_WEEKDAYS = {"MO", "TU", "WE", "TH", "FR", "SA", "SU"}
-
-
-def _spec_to_vrecur(spec: dict) -> vRecur:
-    freq = str(spec["frequency"]).upper()
-    if freq not in ("DAILY", "WEEKLY", "MONTHLY", "YEARLY"):
-        raise ValueError("frequency must be daily|weekly|monthly|yearly")
-    d: dict[str, Any] = {"FREQ": [freq]}
-    if spec.get("interval"):
-        d["INTERVAL"] = [int(spec["interval"])]
-    if spec.get("days_of_week"):
-        days = []
-        for x in spec["days_of_week"]:
-            code = str(x).upper()[:2]
-            if code not in _WEEKDAYS:
-                raise ValueError(f"bad weekday: {x!r}")
-            days.append(code)
-        d["BYDAY"] = days
-    if spec.get("days_of_month"):
-        d["BYMONTHDAY"] = [int(x) for x in spec["days_of_month"]]
-    if spec.get("count"):
-        d["COUNT"] = [int(spec["count"])]
-    elif spec.get("end_date"):
-        until = _localize(_parse_dt(spec["end_date"])).astimezone(timezone.utc)
-        d["UNTIL"] = [until]
-    return vRecur(d)
-
-
-def _vrecur_to_spec(rr) -> Optional[dict]:  # noqa: ANN001
-    if not rr:
+def _from_nsdate(nsdate) -> Optional[str]:  # noqa: ANN001
+    if nsdate is None:
         return None
+    return datetime.fromtimestamp(nsdate.timeIntervalSince1970()).isoformat()
 
-    def first(key):
-        v = rr.get(key)
-        if isinstance(v, list):
-            return v[0] if v else None
-        return v
 
-    freq = first("FREQ")
-    spec: dict[str, Any] = {
-        "frequency": str(freq).lower() if freq else None,
-        "interval": int(first("INTERVAL") or 1),
+# ---------------------------------------------------------------------------
+# Recurrence helpers
+# ---------------------------------------------------------------------------
+
+_FREQ_BY_NAME = {"daily": 0, "weekly": 1, "monthly": 2, "yearly": 3}
+_FREQ_BY_VALUE = {v: k for k, v in _FREQ_BY_NAME.items()}
+
+# EKWeekday: Sunday=1 .. Saturday=7
+_WEEKDAY_BY_NAME = {
+    "su": 1, "mo": 2, "tu": 3, "we": 4, "th": 5, "fr": 6, "sa": 7,
+}
+_WEEKDAY_NAME = {1: "SU", 2: "MO", 3: "TU", 4: "WE", 5: "TH", 6: "FR", 7: "SA"}
+
+
+def _build_rule(spec: dict) -> Any:
+    """Build an EKRecurrenceRule from a spec dict.
+
+    Keys: frequency (daily|weekly|monthly|yearly), interval (int, default 1),
+    days_of_week (list like ['MO','WE','FR']), days_of_month (list of ints,
+    negative counts from end), count (int), end_date (ISO string).
+    """
+    freq_name = str(spec["frequency"]).lower()
+    if freq_name not in _FREQ_BY_NAME:
+        raise ValueError(f"frequency must be one of {list(_FREQ_BY_NAME)}")
+    freq = _FREQ_BY_NAME[freq_name]
+    interval = int(spec.get("interval", 1) or 1)
+
+    days_of_week = None
+    if spec.get("days_of_week"):
+        days_of_week = []
+        for d in spec["days_of_week"]:
+            key = str(d).lower()[:2]
+            if key not in _WEEKDAY_BY_NAME:
+                raise ValueError(f"bad weekday: {d!r}")
+            days_of_week.append(
+                EventKit.EKRecurrenceDayOfWeek.dayOfWeek_(_WEEKDAY_BY_NAME[key])
+            )
+
+    days_of_month = None
+    if spec.get("days_of_month"):
+        days_of_month = [int(x) for x in spec["days_of_month"]]
+
+    end = None
+    if spec.get("count"):
+        end = EventKit.EKRecurrenceEnd.recurrenceEndWithOccurrenceCount_(
+            int(spec["count"])
+        )
+    elif spec.get("end_date"):
+        end = EventKit.EKRecurrenceEnd.recurrenceEndWithEndDate_(
+            _to_nsdate(spec["end_date"])
+        )
+
+    return (
+        EventKit.EKRecurrenceRule.alloc()
+        .initRecurrenceWithFrequency_interval_daysOfTheWeek_daysOfTheMonth_monthsOfTheYear_weeksOfTheYear_daysOfTheYear_setPositions_end_(
+            freq, interval, days_of_week, days_of_month, None, None, None, None, end
+        )
+    )
+
+
+def _summarize_rules(rules) -> Optional[list]:  # noqa: ANN001
+    if not rules:
+        return None
+    out = []
+    for r in rules:
+        d: dict[str, Any] = {
+            "frequency": _FREQ_BY_VALUE.get(r.frequency()),
+            "interval": r.interval(),
+        }
+        if r.daysOfTheWeek():
+            d["days_of_week"] = [_WEEKDAY_NAME.get(x.dayOfTheWeek()) for x in r.daysOfTheWeek()]
+        if r.daysOfTheMonth():
+            d["days_of_month"] = [int(x) for x in r.daysOfTheMonth()]
+        end = r.recurrenceEnd()
+        if end is not None:
+            if end.occurrenceCount():
+                d["count"] = end.occurrenceCount()
+            elif end.endDate():
+                d["end_date"] = _from_nsdate(end.endDate())
+        out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Event lookup + serialization
+# ---------------------------------------------------------------------------
+
+def _resolve_calendar(calendar_id: Optional[str]):
+    if not calendar_id:
+        cal = _store.defaultCalendarForNewEvents()
+        if cal is None:
+            raise RuntimeError("No default calendar available; pass calendar_id.")
+        return cal
+    for c in _store.calendarsForEntityType_(EK_ENTITY_EVENT):
+        if c.calendarIdentifier() == calendar_id or c.title() == calendar_id:
+            return c
+    raise ValueError(f"Calendar not found: {calendar_id!r}")
+
+
+def _calendar_by_id(calendar_id: str):
+    """Strict lookup by calendar identifier only (no title fuzzy-match).
+    Used for destructive/color ops so a title can't accidentally match."""
+    for c in _store.calendarsForEntityType_(EK_ENTITY_EVENT):
+        if c.calendarIdentifier() == calendar_id:
+            return c
+    raise ValueError(f"No calendar with id {calendar_id!r}")
+
+
+# EKSourceType: local=0, exchange=1, caldav(iCloud)=2, mobileme=3, subscribed=4, birthdays=5
+def _resolve_source(source_hint: Optional[str]):
+    sources = list(_store.sources() or [])
+    if source_hint:
+        for s in sources:
+            if s.title() == source_hint:
+                return s
+        raise ValueError(
+            f"Source {source_hint!r} not found. Available: "
+            f"{[s.title() for s in sources]}"
+        )
+    # default: the source that owns the default calendar
+    dc = _store.defaultCalendarForNewEvents()
+    if dc is not None and dc.source() is not None:
+        return dc.source()
+    for wanted in (2, 0):  # prefer iCloud (CalDAV), then Local
+        for s in sources:
+            if s.sourceType() == wanted:
+                return s
+    if sources:
+        return sources[0]
+    raise RuntimeError("No calendar source available to create a calendar in.")
+
+
+def _nscolor_from_hex(value: str):
+    h = value.strip().lstrip("#")
+    if len(h) != 6:
+        raise ValueError(f"color must be a hex string like '#FF3B30', got {value!r}")
+    r, g, b = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    return NSColor.colorWithSRGBRed_green_blue_alpha_(r, g, b, 1.0)
+
+
+def _hex_from_calendar(cal) -> Optional[str]:  # noqa: ANN001
+    ns = None
+    try:
+        ns = cal.color()
+    except Exception:
+        ns = None
+    if ns is None:
+        try:
+            cg = cal.CGColor()
+            if cg is not None:
+                ns = NSColor.colorWithCGColor_(cg)
+        except Exception:
+            ns = None
+    if ns is None:
+        return None
+    rgb = ns.colorUsingColorSpace_(NSColorSpace.sRGBColorSpace())
+    if rgb is None:
+        return None
+    return "#%02X%02X%02X" % (
+        round(rgb.redComponent() * 255),
+        round(rgb.greenComponent() * 255),
+        round(rgb.blueComponent() * 255),
+    )
+
+
+def _set_calendar_color(cal, value: str) -> None:  # noqa: ANN001
+    nscolor = _nscolor_from_hex(value)
+    try:
+        cal.setColor_(nscolor)
+    except Exception:
+        cal.setCGColor_(nscolor.CGColor())
+
+
+def _serialize_calendar(cal) -> dict:  # noqa: ANN001
+    default = _store.defaultCalendarForNewEvents()
+    default_id = default.calendarIdentifier() if default else None
+    return {
+        "calendar_id": cal.calendarIdentifier(),
+        "title": cal.title(),
+        "source": cal.source().title() if cal.source() else None,
+        "color": _hex_from_calendar(cal),
+        "writable": bool(cal.allowsContentModifications()),
+        "is_default": cal.calendarIdentifier() == default_id,
     }
-    if rr.get("BYDAY"):
-        spec["days_of_week"] = [str(x) for x in rr.get("BYDAY")]
-    if rr.get("BYMONTHDAY"):
-        spec["days_of_month"] = [int(x) for x in rr.get("BYMONTHDAY")]
-    if rr.get("COUNT"):
-        spec["count"] = int(first("COUNT"))
-    if rr.get("UNTIL"):
-        u = first("UNTIL")
-        spec["end_date"] = u.isoformat() if hasattr(u, "isoformat") else str(u)
-    return spec
 
 
-# ---------------------------------------------------------------------------
-# iCalendar component build + field application
-# ---------------------------------------------------------------------------
-
-def _new_vcal() -> ICalendar:
-    cal = ICalendar()
-    cal.add("prodid", "-//apple-calendar-mcp//EN")
-    cal.add("version", "2.0")
-    return cal
+def _save_calendar(cal) -> None:  # noqa: ANN001
+    ok, err = _store.saveCalendar_commit_error_(cal, True, None)
+    if not ok:
+        raise RuntimeError(
+            f"Calendar save failed: "
+            f"{err.localizedDescription() if err else 'unknown error'}"
+        )
 
 
-def _mk_dtstart(value: str, all_day: bool):
-    if all_day:
-        return _parse_dt(value).date()
-    return _localize(_parse_dt(value))
+def _find_occurrence(event_id: str, occurrence_start: str):
+    target = _parse_dt(occurrence_start).timestamp()
+    lo = NSDate.dateWithTimeIntervalSince1970_(target - 86400)
+    hi = NSDate.dateWithTimeIntervalSince1970_(target + 86400)
+    pred = _store.predicateForEventsWithStartDate_endDate_calendars_(lo, hi, None)
+    best, best_diff = None, 1e18
+    for e in _store.eventsMatchingPredicate_(pred):
+        if e.eventIdentifier() == event_id:
+            diff = abs(e.startDate().timeIntervalSince1970() - target)
+            if diff < best_diff:
+                best, best_diff = e, diff
+    if best is None or best_diff > 120:
+        raise ValueError(
+            f"No occurrence of {event_id} found near {occurrence_start}. "
+            "Pass an occurrence_start that matches a listed occurrence."
+        )
+    return best
 
 
-def _build_vevent(
-    title, start, end, all_day, location, notes, url, recurrence, uid=None
-):  # noqa: ANN001
-    ev = IEvent()
-    ev.add("uid", uid or str(uuid.uuid4()))
-    ev.add("dtstamp", datetime.now(timezone.utc))
-    ev.add("summary", title)
-    dtstart = _mk_dtstart(start, all_day)
-    if end:
-        dtend = _mk_dtstart(end, all_day)
-    elif all_day:
-        dtend = dtstart + timedelta(days=1)
-    else:
-        dtend = dtstart + timedelta(hours=1)
-    if all_day and dtend <= dtstart:
-        dtend = dtstart + timedelta(days=1)
-    ev.add("dtstart", dtstart)
-    ev.add("dtend", dtend)
-    if location:
-        ev.add("location", location)
-    if notes:
-        ev.add("description", notes)
-    if url:
-        ev.add("url", url)
-    if recurrence:
-        ev.add("rrule", _spec_to_vrecur(recurrence))
+def _get_event(event_id: str, occurrence_start: Optional[str]):
+    if occurrence_start:
+        return _find_occurrence(event_id, occurrence_start)
+    ev = _store.eventWithIdentifier_(event_id)
+    if ev is None:
+        raise ValueError(f"Event not found: {event_id!r}")
     return ev
 
 
-def _set_or_del(comp, key: str, value) -> None:  # noqa: ANN001
-    comp.pop(key, None)
-    if value:
-        comp.add(key, value)
+def _resolve_span(event, span: str, occurrence_start: Optional[str]):  # noqa: ANN001
+    """Map a friendly span onto (EKEvent, EKSpan)."""
+    if not event.hasRecurrenceRules() and not event.isDetached():
+        return event, EK_SPAN_THIS
+    span = (span or "this").lower()
+    if span == "all":
+        master = _store.eventWithIdentifier_(event.eventIdentifier())
+        return (master or event), EK_SPAN_FUTURE
+    if span == "future":
+        return event, EK_SPAN_FUTURE
+    return event, EK_SPAN_THIS
 
 
-def _apply_fields(comp, title, start, end, all_day, location, notes, url):  # noqa: ANN001
-    if title is not None:
-        _set_or_del(comp, "summary", title)
-    cur_all = "dtstart" in comp and not isinstance(comp["dtstart"].dt, datetime)
-    is_all = cur_all if all_day is None else bool(all_day)
-    if start is not None:
-        comp.pop("dtstart", None)
-        comp.add("dtstart", _mk_dtstart(start, is_all))
-    if end is not None:
-        comp.pop("dtend", None)
-        comp.add("dtend", _mk_dtstart(end, is_all))
-    if location is not None:
-        _set_or_del(comp, "location", location)
-    if notes is not None:
-        _set_or_del(comp, "description", notes)
-    if url is not None:
-        _set_or_del(comp, "url", url)
-
-
-def _serialize_comp(comp, cal_url=None, cal_name=None) -> dict:  # noqa: ANN001
-    dtstart = comp.get("dtstart")
-    dtend = comp.get("dtend")
-    start = dtstart.dt if dtstart is not None else None
-    end = dtend.dt if dtend is not None else None
-    all_day = isinstance(start, date) and not isinstance(start, datetime)
-    rrule = comp.get("rrule")
-    rec = _vrecur_to_spec(rrule) if rrule else None
+def _serialize(e) -> dict:  # noqa: ANN001
+    url = e.URL()
     return {
-        "event_id": str(comp.get("uid")) if comp.get("uid") else None,
-        "title": str(comp.get("summary")) if comp.get("summary") else None,
-        "calendar": cal_name,
-        "calendar_id": cal_url,
-        "start": _fmt(start),
-        "end": _fmt(end),
-        "all_day": bool(all_day),
-        "location": str(comp.get("location")) if comp.get("location") else None,
-        "notes": str(comp.get("description")) if comp.get("description") else None,
-        "url": str(comp.get("url")) if comp.get("url") else None,
-        "is_recurring": bool(rrule) or comp.get("recurrence-id") is not None,
-        "is_detached": comp.get("recurrence-id") is not None,
-        "recurrence": [rec] if rec else None,
+        "event_id": e.eventIdentifier(),
+        "title": e.title(),
+        "calendar": e.calendar().title() if e.calendar() else None,
+        "calendar_id": e.calendar().calendarIdentifier() if e.calendar() else None,
+        "start": _from_nsdate(e.startDate()),
+        "end": _from_nsdate(e.endDate()),
+        "all_day": bool(e.isAllDay()),
+        "location": e.location(),
+        "notes": e.notes(),
+        "url": url.absoluteString() if url else None,
+        "is_recurring": bool(e.hasRecurrenceRules()),
+        "is_detached": bool(e.isDetached()),
+        "recurrence": _summarize_rules(e.recurrenceRules()),
     }
 
 
-# ---------------------------------------------------------------------------
-# Recurring-event plumbing (find resource, occurrences, spans)
-# ---------------------------------------------------------------------------
-
-def _find_resource(uid: str):
-    """Return (caldav_calendar, caldav_event_resource) for a UID, searching all
-    calendars. The resource holds the master VEVENT (+ any override VEVENTs)."""
-    import caldav
-
-    for cal in _calendars():
-        try:
-            res = cal.event_by_uid(uid)
-            if res is not None:
-                return cal, res
-        except caldav.error.NotFoundError:
-            continue
-        except Exception:
-            continue
-    raise ValueError(f"Event not found: {uid!r}")
+def _save(event, span) -> None:  # noqa: ANN001
+    ok, err = _store.saveEvent_span_error_(event, span, None)
+    if not ok:
+        raise RuntimeError(
+            f"Save failed: {err.localizedDescription() if err else 'unknown error'}"
+        )
 
 
-def _master_vevent(vcal):  # noqa: ANN001
-    vevents = [c for c in vcal.subcomponents if c.name == "VEVENT"]
-    for c in vevents:
-        if c.get("recurrence-id") is None:
-            return c
-    return vevents[0] if vevents else None
+def _remove(event, span) -> None:  # noqa: ANN001
+    ok, err = _store.removeEvent_span_error_(event, span, None)
+    if not ok:
+        raise RuntimeError(
+            f"Delete failed: {err.localizedDescription() if err else 'unknown error'}"
+        )
 
 
-def _occurrence_dt(master, occurrence_start: str):  # noqa: ANN001
-    dts = master.get("dtstart").dt
-    target = _parse_dt(occurrence_start)
-    if isinstance(dts, datetime):
-        tz = dts.tzinfo or _LOCAL_TZ
-        return target.replace(tzinfo=tz) if target.tzinfo is None else target.astimezone(tz)
-    return target.date()
-
-
-def _duration(master):  # noqa: ANN001
-    dts = master.get("dtstart")
-    dte = master.get("dtend")
-    if dts is not None and dte is not None:
-        return dte.dt - dts.dt
-    return timedelta(hours=1)
-
-
-def _add_exdate(master, occ_dt) -> None:  # noqa: ANN001
-    master.add("exdate", occ_dt)
-
-
-def _truncate_until(master, occ_dt) -> None:  # noqa: ANN001
-    rr = master.get("rrule")
-    if rr is None:
-        return
-    rr.pop("COUNT", None)
-    if isinstance(occ_dt, datetime):
-        until = occ_dt.astimezone(timezone.utc) - timedelta(seconds=1)
-    else:
-        until = occ_dt - timedelta(days=1)
-    rr["UNTIL"] = [until]
-
-
-def _find_override(vcal, occ_dt):  # noqa: ANN001
-    for c in vcal.subcomponents:
-        if c.name != "VEVENT":
-            continue
-        rid = c.get("recurrence-id")
-        if rid is not None and rid.dt == occ_dt:
-            return c
-    return None
-
-
-def _make_override(master, occ_dt):  # noqa: ANN001
-    ov = IEvent()
-    for key in ("uid", "summary", "location", "description", "url"):
-        if master.get(key) is not None:
-            ov.add(key, master.get(key))
-    ov.add("dtstamp", datetime.now(timezone.utc))
-    ov.add("recurrence-id", occ_dt)
-    ov.add("dtstart", occ_dt)
-    ov.add("dtend", occ_dt + _duration(master))
-    return ov
-
-
-def _save_resource(res, vcal) -> None:  # noqa: ANN001
-    res.data = vcal.to_ical().decode("utf-8")
-    res.save()
+def _apply_fields(e, title, start, end, all_day, location, notes, url):  # noqa: ANN001
+    if title is not None:
+        e.setTitle_(title)
+    if all_day is not None:
+        e.setAllDay_(bool(all_day))
+    if start is not None:
+        e.setStartDate_(_to_nsdate(start))
+    if end is not None:
+        e.setEndDate_(_to_nsdate(end))
+    if location is not None:
+        e.setLocation_(location or None)
+    if notes is not None:
+        e.setNotes_(notes or None)
+    if url is not None:
+        e.setURL_(NSURL.URLWithString_(url) if url else None)
 
 
 # ---------------------------------------------------------------------------
-# Tools  (identical names + parameters to the EventKit version)
+# Tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 def list_calendars() -> list:
     """List all calendars, with their id, title, source, color (hex), whether
-    they're writable, and which is the default.
+    they're writable, and which is the default."""
+    _ensure_access()
+    return [
+        _serialize_calendar(c)
+        for c in _store.calendarsForEntityType_(EK_ENTITY_EVENT)
+    ]
 
-    Note: subscribed / webcal (read-only) calendars are NOT returned — iCloud
-    does not expose those over CalDAV.
+
+@mcp.tool()
+def create_calendar(
+    title: str,
+    color: Optional[str] = None,
+    source: Optional[str] = None,
+) -> dict:
+    """Create a new calendar and return it.
+
+    Args:
+        title: Name for the new calendar.
+        color: Optional hex color, e.g. '#FF3B30'.
+        source: Optional account/source title to create it in (e.g. 'iCloud',
+            'On My Mac'). Default: the source of your default calendar. Use
+            list_calendars to see which sources exist.
     """
-    return [_serialize_calendar(c) for c in _calendars(refresh=True)]
+    _ensure_access()
+    cal = EventKit.EKCalendar.calendarForEntityType_eventStore_(EK_ENTITY_EVENT, _store)
+    cal.setTitle_(title)
+    cal.setSource_(_resolve_source(source))
+    if color:
+        _set_calendar_color(cal, color)
+    _save_calendar(cal)
+    return _serialize_calendar(cal)
+
+
+@mcp.tool()
+def set_calendar_color(calendar_id: str, color: str) -> dict:
+    """Set a calendar's color. `color` is a hex string like '#34C759'.
+    Requires the calendar's id (from list_calendars), not its title."""
+    _ensure_access()
+    cal = _calendar_by_id(calendar_id)
+    if not cal.allowsContentModifications():
+        raise ValueError("That calendar is read-only/subscribed; its color can't be changed.")
+    _set_calendar_color(cal, color)
+    _save_calendar(cal)
+    return _serialize_calendar(cal)
+
+
+@mcp.tool()
+def delete_calendar(calendar_id: str) -> dict:
+    """Permanently delete a calendar AND all events in it. Irreversible.
+
+    Requires the calendar's exact id (from list_calendars), never a title, so it
+    can't fire on a fuzzy match. Refuses read-only/subscribed calendars.
+    """
+    _ensure_access()
+    cal = _calendar_by_id(calendar_id)
+    if not cal.allowsContentModifications():
+        raise ValueError("Refusing to delete a read-only/subscribed calendar.")
+    title = cal.title()
+    ok, err = _store.removeCalendar_commit_error_(cal, True, None)
+    if not ok:
+        raise RuntimeError(
+            f"Delete failed: {err.localizedDescription() if err else 'unknown error'}"
+        )
+    return {"deleted": True, "calendar_id": calendar_id, "title": title}
 
 
 @mcp.tool()
@@ -501,34 +489,20 @@ def list_events(
         calendar_id: Restrict to one calendar (id or title). Default: all.
         query: Optional case-insensitive substring filter on title/location/notes.
     """
-    cals = [_resolve_calendar(calendar_id)] if calendar_id else _calendars()
-    s = _localize(_parse_dt(start))
-    e = _localize(_parse_dt(end))
-    out: list[dict] = []
-    for cal in cals:
-        cal_url, cal_name = str(cal.url), _cal_name(cal)
-        try:
-            results = cal.search(start=s, end=e, event=True, expand=True)
-        except Exception:
-            results = cal.date_search(start=s, end=e)
-        for r in results:
-            for comp in r.icalendar_instance.subcomponents:
-                if comp.name == "VEVENT":
-                    out.append(_serialize_comp(comp, cal_url, cal_name))
-    # best-effort recurrence flag: a UID appearing >1x in the window is a series
-    counts: dict[str, int] = {}
-    for ev in out:
-        counts[ev["event_id"]] = counts.get(ev["event_id"], 0) + 1
-    for ev in out:
-        if counts.get(ev["event_id"], 0) > 1:
-            ev["is_recurring"] = True
-    out.sort(key=lambda ev: ev["start"] or "")
+    _ensure_access()
+    cals = [_resolve_calendar(calendar_id)] if calendar_id else None
+    pred = _store.predicateForEventsWithStartDate_endDate_calendars_(
+        _to_nsdate(start), _to_nsdate(end), cals
+    )
+    events = list(_store.eventsMatchingPredicate_(pred) or [])
+    events.sort(key=lambda e: e.startDate().timeIntervalSince1970())
+    out = [_serialize(e) for e in events]
     if query:
         q = query.lower()
         out = [
-            ev for ev in out
+            e for e in out
             if q in " ".join(
-                str(ev.get(k) or "") for k in ("title", "location", "notes")
+                str(e.get(k) or "") for k in ("title", "location", "notes")
             ).lower()
         ]
     return out
@@ -538,17 +512,8 @@ def list_events(
 def get_event(event_id: str, occurrence_start: Optional[str] = None) -> dict:
     """Fetch full detail for a single event (or a specific occurrence if
     occurrence_start is given)."""
-    cal, res = _find_resource(event_id)
-    vcal = res.icalendar_instance
-    master = _master_vevent(vcal)
-    if occurrence_start:
-        occ_dt = _occurrence_dt(master, occurrence_start)
-        comp = _find_override(vcal, occ_dt)
-        if comp is None:
-            comp = _make_override(master, occ_dt)  # synthesized view of the occurrence
-    else:
-        comp = master
-    return _serialize_comp(comp, str(cal.url), _cal_name(cal))
+    _ensure_access()
+    return _serialize(_get_event(event_id, occurrence_start))
 
 
 @mcp.tool()
@@ -579,14 +544,14 @@ def create_event(
             days_of_week (e.g. ['MO','WE','FR']), days_of_month (list of ints),
             count (int, total occurrences) OR end_date (ISO date).
     """
-    cal = _resolve_calendar(calendar_id)
-    if all_day is False and _is_date_only(start) and _is_date_only(end):
-        all_day = True
-    ev = _build_vevent(title, start, end, all_day, location, notes, url, recurrence)
-    vcal = _new_vcal()
-    vcal.add_component(ev)
-    cal.save_event(vcal.to_ical())
-    return _serialize_comp(ev, str(cal.url), _cal_name(cal))
+    _ensure_access()
+    e = EventKit.EKEvent.eventWithEventStore_(_store)
+    e.setCalendar_(_resolve_calendar(calendar_id))
+    _apply_fields(e, title, start, end, all_day, location, notes, url)
+    if recurrence:
+        e.addRecurrenceRule_(_build_rule(recurrence))
+    _save(e, EK_SPAN_THIS)
+    return _serialize(e)
 
 
 @mcp.tool()
@@ -610,76 +575,26 @@ def update_event(
     For recurring events, target a specific occurrence by passing occurrence_start
     (the start of the occurrence as returned by list_events) and choose the scope
     with span:
-        'this'   -> only this occurrence (detaches it into an override)
-        'future' -> this occurrence and all later ones (splits the series)
+        'this'   -> only this occurrence (detaches it from the series)
+        'future' -> this occurrence and all later ones
         'all'    -> the entire series
 
     To change how an event recurs, pass a new `recurrence` spec (see create_event).
     To turn a recurring event into a one-off, pass clear_recurrence=True.
     Pass empty strings ('') to clear location/notes/url.
     """
-    cal, res = _find_resource(event_id)
-    vcal = res.icalendar_instance
-    master = _master_vevent(vcal)
-    is_rec = master.get("rrule") is not None
-    span = (span or "this").lower()
-
-    # Whole-event edits (non-recurring, or explicit 'all', or no occurrence given)
-    if not is_rec or span == "all" or occurrence_start is None:
-        _apply_fields(master, title, start, end, all_day, location, notes, url)
-        if clear_recurrence:
-            master.pop("rrule", None)
-            master.pop("exdate", None)
-        elif recurrence is not None:
-            master.pop("rrule", None)
-            master.add("rrule", _spec_to_vrecur(recurrence))
-        if calendar_id is not None:
-            return _move_event(res, vcal, master, calendar_id)
-        _save_resource(res, vcal)
-        return _serialize_comp(master, str(cal.url), _cal_name(cal))
-
-    occ_dt = _occurrence_dt(master, occurrence_start)
-
-    if span == "this":
-        override = _find_override(vcal, occ_dt) or _make_override(master, occ_dt)
-        _apply_fields(override, title, start, end, all_day, location, notes, url)
-        if _find_override(vcal, occ_dt) is None:
-            vcal.add_component(override)
-        _save_resource(res, vcal)
-        return _serialize_comp(override, str(cal.url), _cal_name(cal))
-
-    # span == 'future': truncate original series, start a new one at occ_dt
-    _truncate_until(master, occ_dt)
-    _save_resource(res, vcal)
-
-    new_ev = IEvent()
-    new_ev.add("uid", str(uuid.uuid4()))
-    new_ev.add("dtstamp", datetime.now(timezone.utc))
-    for key in ("summary", "location", "description", "url"):
-        if master.get(key) is not None:
-            new_ev.add(key, master.get(key))
-    new_ev.add("dtstart", occ_dt)
-    new_ev.add("dtend", occ_dt + _duration(master))
-    if master.get("rrule") is not None and recurrence is None:
-        rr = vRecur(dict(master.get("rrule")))
-        rr.pop("UNTIL", None)
-        new_ev.add("rrule", rr)
-    elif recurrence is not None and not clear_recurrence:
-        new_ev.add("rrule", _spec_to_vrecur(recurrence))
-    _apply_fields(new_ev, title, start, end, all_day, location, notes, url)
-    tgt_cal = _resolve_calendar(calendar_id) if calendar_id else cal
-    nv = _new_vcal()
-    nv.add_component(new_ev)
-    tgt_cal.save_event(nv.to_ical())
-    return _serialize_comp(new_ev, str(tgt_cal.url), _cal_name(tgt_cal))
-
-
-def _move_event(res, vcal, master, calendar_id):  # noqa: ANN001
-    """Move a whole event to another calendar (CalDAV: copy to target + delete)."""
-    tgt = _resolve_calendar(calendar_id)
-    tgt.save_event(vcal.to_ical())
-    res.delete()
-    return _serialize_comp(master, str(tgt.url), _cal_name(tgt))
+    _ensure_access()
+    e = _get_event(event_id, occurrence_start)
+    target, ek_span = _resolve_span(e, span, occurrence_start)
+    _apply_fields(target, title, start, end, all_day, location, notes, url)
+    if calendar_id is not None:
+        target.setCalendar_(_resolve_calendar(calendar_id))
+    if clear_recurrence:
+        target.setRecurrenceRules_(None)
+    elif recurrence is not None:
+        target.setRecurrenceRules_([_build_rule(recurrence)])
+    _save(target, ek_span)
+    return _serialize(target)
 
 
 @mcp.tool()
@@ -692,29 +607,14 @@ def delete_event(
 
     For a non-recurring event, just pass event_id.
     For a recurring event, pass occurrence_start and a span:
-        'this'   -> delete only that occurrence (adds an EXDATE)
-        'future' -> delete that occurrence and all later ones (UNTIL split)
+        'this'   -> delete only that occurrence
+        'future' -> delete that occurrence and all later ones
         'all'    -> delete the entire series
     """
-    cal, res = _find_resource(event_id)
-    vcal = res.icalendar_instance
-    master = _master_vevent(vcal)
-    is_rec = master.get("rrule") is not None
-    span = (span or "this").lower()
-
-    if not is_rec or span == "all" or occurrence_start is None:
-        res.delete()
-        return {"deleted": True, "event_id": event_id, "span": span}
-
-    occ_dt = _occurrence_dt(master, occurrence_start)
-    if span == "future":
-        _truncate_until(master, occ_dt)
-    else:  # this
-        _add_exdate(master, occ_dt)
-        ov = _find_override(vcal, occ_dt)
-        if ov is not None:
-            vcal.subcomponents.remove(ov)
-    _save_resource(res, vcal)
+    _ensure_access()
+    e = _get_event(event_id, occurrence_start)
+    target, ek_span = _resolve_span(e, span, occurrence_start)
+    _remove(target, ek_span)
     return {"deleted": True, "event_id": event_id, "span": span}
 
 
@@ -731,252 +631,36 @@ def detach_occurrence(
     calendar_id: Optional[str] = None,
 ) -> dict:
     """Create a standalone, non-recurring copy of a single occurrence of a
-    recurring event. The new event is fully independent of the series (new UID,
-    no recurrence rule).
+    recurring event. The new event is fully independent of the series.
 
     Optionally override any field on the copy, and optionally remove that
     occurrence from the original series (delete_from_series=True) so it isn't
     duplicated.
     """
-    cal, res = _find_resource(event_id)
-    vcal = res.icalendar_instance
-    master = _master_vevent(vcal)
-    occ_dt = _occurrence_dt(master, occurrence_start)
-    dur = _duration(master)
+    _ensure_access()
+    occ = _find_occurrence(event_id, occurrence_start)
 
-    copy = IEvent()
-    copy.add("uid", str(uuid.uuid4()))
-    copy.add("dtstamp", datetime.now(timezone.utc))
-    copy.add("summary", title if title is not None else (master.get("summary") or ""))
-    copy.add("dtstart", _mk_dtstart(start, isinstance(occ_dt, date) and not isinstance(occ_dt, datetime)) if start else occ_dt)
-    if end:
-        copy.add("dtend", _mk_dtstart(end, isinstance(occ_dt, date) and not isinstance(occ_dt, datetime)))
-    else:
-        copy.add("dtend", occ_dt + dur)
-    loc = location if location is not None else master.get("location")
-    if loc:
-        copy.add("location", loc)
-    desc = notes if notes is not None else master.get("description")
-    if desc:
-        copy.add("description", desc)
-    if master.get("url"):
-        copy.add("url", master.get("url"))
-
-    tgt = _resolve_calendar(calendar_id) if calendar_id else cal
-    nv = _new_vcal()
-    nv.add_component(copy)
-    tgt.save_event(nv.to_ical())
+    copy = EventKit.EKEvent.eventWithEventStore_(_store)
+    copy.setCalendar_(
+        _resolve_calendar(calendar_id) if calendar_id else occ.calendar()
+    )
+    copy.setTitle_(title if title is not None else occ.title())
+    copy.setStartDate_(_to_nsdate(start) if start else occ.startDate())
+    copy.setEndDate_(_to_nsdate(end) if end else occ.endDate())
+    copy.setAllDay_(occ.isAllDay())
+    copy.setLocation_(location if location is not None else occ.location())
+    copy.setNotes_(notes if notes is not None else occ.notes())
+    if occ.URL():
+        copy.setURL_(occ.URL())
+    _save(copy, EK_SPAN_THIS)
 
     if delete_from_series:
-        _add_exdate(master, occ_dt)
-        _save_resource(res, vcal)
+        # re-fetch: the object may have changed after the save above
+        occ2 = _find_occurrence(event_id, occurrence_start)
+        _remove(occ2, EK_SPAN_THIS)
 
-    return {
-        "created": _serialize_comp(copy, str(tgt.url), _cal_name(tgt)),
-        "removed_from_series": bool(delete_from_series),
-    }
-
-
-@mcp.tool()
-def create_calendar(
-    title: str,
-    color: Optional[str] = None,
-    source: Optional[str] = None,
-) -> dict:
-    """Create a new calendar and return it.
-
-    Args:
-        title: Name for the new calendar.
-        color: Optional hex color, e.g. '#FF3B30'.
-        source: Ignored for iCloud CalDAV (single account). Accepted for
-            interface compatibility.
-    """
-    p = _principal()
-    cal = p.make_calendar(name=title)
-    if color:
-        _set_cal_color(cal, color)
-    _calendars(refresh=True)
-    return _serialize_calendar(cal)
-
-
-@mcp.tool()
-def set_calendar_color(calendar_id: str, color: str) -> dict:
-    """Set a calendar's color. `color` is a hex string like '#34C759'.
-    Requires the calendar's id (from list_calendars), not its title."""
-    cal = _calendar_by_id_strict(calendar_id)
-    _set_cal_color(cal, color)
-    return _serialize_calendar(cal)
-
-
-@mcp.tool()
-def delete_calendar(calendar_id: str) -> dict:
-    """Permanently delete a calendar AND all events in it. Irreversible.
-
-    Requires the calendar's exact id (from list_calendars), never a title, so it
-    can't fire on a fuzzy match.
-    """
-    cal = _calendar_by_id_strict(calendar_id)
-    title = _cal_name(cal)
-    cal.delete()
-    _calendars(refresh=True)
-    return {"deleted": True, "calendar_id": calendar_id, "title": title}
-
-
-# ---------------------------------------------------------------------------
-# Tailscale identity auth (HTTP mode)
-# ---------------------------------------------------------------------------
-
-class _UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, socket_path: str, timeout: float = 5.0):
-        super().__init__("localhost", timeout=timeout)
-        self._socket_path = socket_path
-
-    def connect(self):
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(self.timeout)
-        s.connect(self._socket_path)
-        self.sock = s
-
-
-def _tailscale_whois(remote_addr: str) -> dict:
-    """Query tailscaled LocalAPI WhoIs for 'ip:port'. Raises on any failure."""
-    conn = _UnixHTTPConnection(TAILSCALE_SOCKET)
-    try:
-        conn.request(
-            "GET",
-            f"/localapi/v0/whois?addr={remote_addr}",
-            headers={"Host": "local-tailscaled.sock"},
-        )
-        resp = conn.getresponse()
-        body = resp.read()
-        if resp.status != 200:
-            raise RuntimeError(f"whois HTTP {resp.status}: {body[:200]!r}")
-        return json.loads(body)
-    finally:
-        conn.close()
-
-
-_ALLOWLIST_CACHE: dict[str, Any] = {"value": "unset"}
-
-
-def _allowlist() -> Optional[set]:
-    if _ALLOWLIST_CACHE["value"] != "unset":
-        return _ALLOWLIST_CACHE["value"]
-    items: set[str] = set()
-    env = os.environ.get("TS_ALLOWED", "").strip()
-    if env:
-        items |= {x.strip() for x in env.split(",") if x.strip()}
-    path = os.environ.get("TS_ALLOWLIST_FILE", "").strip()
-    if path and os.path.exists(path):
-        with open(path) as f:
-            items |= {ln.strip() for ln in f if ln.strip() and not ln.startswith("#")}
-    value = items or None
-    _ALLOWLIST_CACHE["value"] = value
-    return value
-
-
-def _authorize(ip: str, port: int) -> tuple[bool, str]:
-    """Resolve the peer to a Tailscale identity and check the allowlist.
-    Fails CLOSED: any WhoIs error => rejected.
-    Exception: if ALLOW_LOOPBACK is set, same-machine callers skip WhoIs."""
-    if ALLOW_LOOPBACK and ip in _LOOPBACK_IPS:
-        return True, "loopback"
-    try:
-        who = _tailscale_whois(f"{ip}:{port}")
-    except Exception as ex:
-        log.error("Tailscale LocalAPI whois failed (fail-closed): %s", ex)
-        return False, f"whois-error:{type(ex).__name__}"
-    node = who.get("Node") or {}
-    user = who.get("UserProfile") or {}
-    name = (node.get("ComputedName") or node.get("Name") or "").rstrip(".")
-    login = user.get("LoginName") or ""
-    identity = name or login or "unknown"
-    allowed = _allowlist()
-    if allowed is None:
-        return True, identity  # open mode (warned at startup)
-    for a in allowed:
-        if a in (name, login, identity) or (name and name.startswith(a + ".")):
-            return True, identity
-    return False, identity
-
-
-class TailscaleAuthASGI:
-    """Pure-ASGI middleware (no response buffering, so SSE streaming works)."""
-
-    def __init__(self, app):  # noqa: ANN001
-        self.app = app
-
-    async def __call__(self, scope, receive, send):  # noqa: ANN001
-        if scope["type"] not in ("http", "websocket"):
-            return await self.app(scope, receive, send)
-        client = scope.get("client")
-        if not client:
-            return await self._deny(send, "no client address")
-        ip, port = client[0], client[1]
-        ok, identity = _authorize(ip, port)
-        if not ok:
-            log.warning("REJECT %s:%s -> %s", ip, port, identity)
-            return await self._deny(send, "forbidden")
-        log.info("ALLOW %s:%s as '%s' (%s)", ip, port, identity, scope.get("path"))
-        scope = dict(scope)
-        scope["ts_identity"] = identity
-        return await self.app(scope, receive, send)
-
-    async def _deny(self, send, msg: str):  # noqa: ANN001
-        await send({
-            "type": "http.response.start",
-            "status": 403,
-            "headers": [(b"content-type", b"application/json")],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": json.dumps({"error": msg}).encode(),
-        })
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def _startup_checks() -> None:
-    if not os.environ.get("ICLOUD_USERNAME") or not os.environ.get("ICLOUD_APP_PASSWORD"):
-        log.warning("ICLOUD_USERNAME / ICLOUD_APP_PASSWORD not set — tools will error.")
-    if ALLOW_LOOPBACK:
-        log.info("ALLOW_LOOPBACK is on — same-machine (127.0.0.1/::1) callers skip WhoIs.")
-    if not os.path.exists(TAILSCALE_SOCKET) and not ALLOW_LOOPBACK:
-        log.warning(
-            "Tailscale socket %s not found — ALL requests will be rejected "
-            "(fail-closed). Is tailscaled running?", TAILSCALE_SOCKET,
-        )
-    if _allowlist() is None:
-        log.warning(
-            "No TS_ALLOWED / TS_ALLOWLIST_FILE set — allowing ANY device that "
-            "resolves on this tailnet. Set an allowlist to restrict."
-        )
-    else:
-        log.info("Allowlist: %s", sorted(_allowlist()))
-
-
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
-    if MCP_TRANSPORT == "stdio":
-        log.info("Starting apple-calendar MCP over stdio (CalDAV backend).")
-        mcp.run()
-        return
-
-    import uvicorn
-
-    _startup_checks()
-    app = TailscaleAuthASGI(mcp.streamable_http_app())
-    log.info(
-        "Serving apple-calendar MCP over HTTP at http://%s:%s/mcp",
-        MCP_HOST, MCP_PORT,
-    )
-    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
+    return {"created": _serialize(copy), "removed_from_series": bool(delete_from_series)}
 
 
 if __name__ == "__main__":
-    main()
+    mcp.run()

@@ -1,10 +1,9 @@
 # Demo prompt
 
-Paste the block below into any Claude client with the `apple-calendar` MCP
-server connected — locally over stdio, or remotely via the Tailscale-auth HTTP
-connector — to see every capability in one run. The scratch calendar it creates
-lives in your iCloud account and is deleted at the end, so **it won't touch any
-of your real events.**
+Paste the block below into **Claude Desktop** (with the `apple-calendar` MCP
+server enabled) to see every capability in one run. It works entirely inside a
+throwaway calendar it creates and then deletes, so **it won't touch any of your
+real events.**
 
 ---
 
