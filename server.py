@@ -56,6 +56,11 @@ MCP_PORT = int(os.environ.get("MCP_PORT", "8420"))
 TAILSCALE_SOCKET = os.environ.get(
     "TAILSCALE_SOCKET", "/var/run/tailscale/tailscaled.sock"
 )
+# Trust same-machine (loopback) callers without a Tailscale WhoIs lookup. Use this
+# for local dev on your Mac before Tailscale is in the picture. Loopback is only
+# reachable from processes on this machine, so it's a sound local trust boundary.
+ALLOW_LOOPBACK = os.environ.get("ALLOW_LOOPBACK", "").lower() in ("1", "true", "yes")
+_LOOPBACK_IPS = {"127.0.0.1", "::1", "localhost"}
 
 
 def _local_tz() -> ZoneInfo:
@@ -872,7 +877,10 @@ def _allowlist() -> Optional[set]:
 
 def _authorize(ip: str, port: int) -> tuple[bool, str]:
     """Resolve the peer to a Tailscale identity and check the allowlist.
-    Fails CLOSED: any WhoIs error => rejected."""
+    Fails CLOSED: any WhoIs error => rejected.
+    Exception: if ALLOW_LOOPBACK is set, same-machine callers skip WhoIs."""
+    if ALLOW_LOOPBACK and ip in _LOOPBACK_IPS:
+        return True, "loopback"
     try:
         who = _tailscale_whois(f"{ip}:{port}")
     except Exception as ex:
@@ -933,7 +941,9 @@ class TailscaleAuthASGI:
 def _startup_checks() -> None:
     if not os.environ.get("ICLOUD_USERNAME") or not os.environ.get("ICLOUD_APP_PASSWORD"):
         log.warning("ICLOUD_USERNAME / ICLOUD_APP_PASSWORD not set — tools will error.")
-    if not os.path.exists(TAILSCALE_SOCKET):
+    if ALLOW_LOOPBACK:
+        log.info("ALLOW_LOOPBACK is on — same-machine (127.0.0.1/::1) callers skip WhoIs.")
+    if not os.path.exists(TAILSCALE_SOCKET) and not ALLOW_LOOPBACK:
         log.warning(
             "Tailscale socket %s not found — ALL requests will be rejected "
             "(fail-closed). Is tailscaled running?", TAILSCALE_SOCKET,

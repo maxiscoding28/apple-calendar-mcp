@@ -96,6 +96,7 @@ All configuration is via environment variables:
 | `MCP_TRANSPORT` | `http` | `http` or `stdio` |
 | `MCP_HOST` | `0.0.0.0` | HTTP bind host |
 | `MCP_PORT` | `8420` | HTTP port |
+| `ALLOW_LOOPBACK` | — | Trust same-machine (127.0.0.1) callers without WhoIs — for local dev |
 | `TS_ALLOWED` | — | Comma-separated allowed Tailscale hostnames/logins |
 | `TS_ALLOWLIST_FILE` | — | File with one allowed identity per line |
 | `TAILSCALE_SOCKET` | `/var/run/tailscale/tailscaled.sock` | tailscaled LocalAPI socket |
