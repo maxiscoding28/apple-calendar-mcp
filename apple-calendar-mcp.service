@@ -1,0 +1,30 @@
+[Unit]
+Description=Apple Calendar MCP server (CalDAV backend, Tailscale-authenticated)
+Documentation=https://github.com/maxiscoding28/apple-calendar-mcp
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=simple
+# --- adjust these three to your install ---
+WorkingDirectory=/opt/apple-calendar-mcp
+EnvironmentFile=/etc/apple-calendar-mcp.env
+ExecStart=/opt/apple-calendar-mcp/.venv/bin/python /opt/apple-calendar-mcp/server.py
+
+# The Tailscale LocalAPI socket is normally root-owned (mode 0660). Either run
+# this service as root (simplest), OR run as an unprivileged user that you have
+# made the Tailscale operator:  sudo tailscale set --operator=<user>
+# and then set User=<user> below.
+# User=youruser
+
+Restart=on-failure
+RestartSec=5
+
+# Optional hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target
