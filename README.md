@@ -1,11 +1,11 @@
 # apple-calendar-mcp
 
 A local [MCP](https://modelcontextprotocol.io) server that gives Claude full
-CRUD access to the **macOS Calendar** via Apple's **EventKit** framework —
-including real recurring-event operations.
+CRUD access to the **macOS Calendar and Reminders** via Apple's **EventKit**
+framework — including real recurring-event operations.
 
 Everything runs on your Mac. No cloud, no accounts, no external services — your
-calendar data never leaves the machine.
+calendar and reminder data never leaves the machine.
 
 ## Requirements
 
@@ -31,6 +31,21 @@ calendar data never leaves the machine.
 > **Note on colors:** Apple Calendar has no per-*event* color — events inherit
 > their calendar's color. So coloring happens at the calendar level; there's no
 > event-color tool because EventKit exposes no such property.
+
+### Reminders tools
+
+| Tool | What it does |
+|------|--------------|
+| `list_reminder_lists` | All reminder lists: id, title, color, writable, default |
+| `list_reminders` | Reminders, filterable by list, completion, and due-date window |
+| `get_reminder` | Full detail for one reminder |
+| `create_reminder` | New reminder (due date, priority, notes, url, optional recurrence) |
+| `update_reminder` | Change any field; mark complete/incomplete; reshape recurrence |
+| `delete_reminder` | Permanently delete a reminder |
+
+Reminders support the same recurrence spec as events, `priority` is
+`none`/`low`/`medium`/`high`, and `due` accepts a date (`2026-08-10`, no
+time-of-day) or a datetime (`2026-08-10T14:30`).
 
 ### Working with recurring events
 
@@ -98,7 +113,9 @@ Claude Desktop** so it picks up the change.
 ## Permissions (the one gotcha)
 
 The first time a tool runs, macOS shows a **"Claude wants to access Calendar"**
-prompt — approve it. The grant is tied to the app that launches the server
+prompt — approve it. Reminders are a **separate** permission, so the first time
+you use a reminders tool you'll get a second **"Claude wants to access
+Reminders"** prompt. Both grants are tied to the app that launches the server
 (Claude Desktop), not to Python.
 
 If it was denied, re-enable it under

@@ -20,6 +20,7 @@ import EventKit
 from Foundation import (
     NSURL,
     NSDate,
+    NSDateComponents,
     NSRunLoop,
     NSDefaultRunLoopMode,
 )
@@ -660,6 +661,340 @@ def detach_occurrence(
         _remove(occ2, EK_SPAN_THIS)
 
     return {"created": _serialize(copy), "removed_from_series": bool(delete_from_series)}
+
+
+# ---------------------------------------------------------------------------
+# Reminders  (EKReminder — same store, separate permission, async fetch)
+# ---------------------------------------------------------------------------
+
+EK_ENTITY_REMINDER = EventKit.EKEntityTypeReminder
+_UNDEF = 9223372036854775807  # NSDateComponentUndefined (NSIntegerMax)
+
+_PRIORITY_TO_INT = {"none": 0, "high": 1, "medium": 5, "low": 9}
+
+
+def _request_full_reminders_access() -> bool:
+    """Trigger the Reminders TCC prompt and block until it resolves."""
+    result: dict[str, Any] = {"done": False, "granted": False}
+
+    def handler(granted, error):  # noqa: ANN001
+        result["granted"] = bool(granted)
+        result["done"] = True
+
+    if hasattr(_store, "requestFullAccessToRemindersWithCompletion_"):
+        _store.requestFullAccessToRemindersWithCompletion_(handler)
+    else:  # pragma: no cover - very old macOS
+        _store.requestAccessToEntityType_completion_(EK_ENTITY_REMINDER, handler)
+
+    runloop = NSRunLoop.currentRunLoop()
+    deadline = time.time() + 60
+    while not result["done"] and time.time() < deadline:
+        runloop.runMode_beforeDate_(
+            NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.1)
+        )
+    return result["granted"]
+
+
+def _ensure_reminders_access() -> None:
+    status = EventKit.EKEventStore.authorizationStatusForEntityType_(EK_ENTITY_REMINDER)
+    if status == _ST_FULL:
+        return
+    if status in (_ST_RESTRICTED, _ST_DENIED):
+        raise RuntimeError(
+            "Reminders access is denied. Grant it in "
+            "System Settings > Privacy & Security > Reminders, enable the app that "
+            "launched this server (Claude), then restart it."
+        )
+    if not _request_full_reminders_access():
+        raise RuntimeError(
+            "Reminders access was not granted. Approve the Reminders prompt, or "
+            "enable it in System Settings > Privacy & Security > Reminders."
+        )
+
+
+def _fetch_reminders(predicate) -> list:  # noqa: ANN001
+    """Reminder fetches are async — block on the completion handler."""
+    result: dict[str, Any] = {"done": False, "items": []}
+
+    def handler(reminders):  # noqa: ANN001
+        result["items"] = list(reminders) if reminders else []
+        result["done"] = True
+
+    _store.fetchRemindersMatchingPredicate_completion_(predicate, handler)
+    runloop = NSRunLoop.currentRunLoop()
+    deadline = time.time() + 30
+    while not result["done"] and time.time() < deadline:
+        runloop.runMode_beforeDate_(
+            NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.05)
+        )
+    return result["items"]
+
+
+def _is_date_only(value: str) -> bool:
+    v = value.strip()
+    return "T" not in v and ":" not in v and len(v) <= 10
+
+
+def _to_due_components(value: str):
+    dt = _parse_dt(value)
+    c = NSDateComponents.alloc().init()
+    c.setYear_(dt.year)
+    c.setMonth_(dt.month)
+    c.setDay_(dt.day)
+    if not _is_date_only(value):
+        c.setHour_(dt.hour)
+        c.setMinute_(dt.minute)
+    return c
+
+
+def _from_due_components(comps) -> Optional[str]:  # noqa: ANN001
+    if comps is None:
+        return None
+    y, mo, d = comps.year(), comps.month(), comps.day()
+    if _UNDEF in (y, mo, d) or y < 1:
+        return None
+    h, mi = comps.hour(), comps.minute()
+    if h == _UNDEF or mi == _UNDEF:
+        return "%04d-%02d-%02d" % (y, mo, d)
+    return "%04d-%02d-%02dT%02d:%02d" % (y, mo, d, h, mi)
+
+
+def _priority_to_int(p) -> Optional[int]:  # noqa: ANN001
+    if p is None:
+        return None
+    if isinstance(p, int):
+        return p
+    key = str(p).lower()
+    if key not in _PRIORITY_TO_INT:
+        raise ValueError("priority must be one of none|low|medium|high")
+    return _PRIORITY_TO_INT[key]
+
+
+def _priority_from_int(n: int) -> str:
+    if n == 0:
+        return "none"
+    if 1 <= n <= 4:
+        return "high"
+    if n == 5:
+        return "medium"
+    return "low"  # 6-9
+
+
+def _resolve_reminder_list(list_id: Optional[str]):
+    if not list_id:
+        cal = _store.defaultCalendarForNewReminders()
+        if cal is None:
+            raise RuntimeError("No default reminder list available; pass list_id.")
+        return cal
+    for c in _store.calendarsForEntityType_(EK_ENTITY_REMINDER):
+        if c.calendarIdentifier() == list_id or c.title() == list_id:
+            return c
+    raise ValueError(f"Reminder list not found: {list_id!r}")
+
+
+def _get_reminder(reminder_id: str):
+    item = _store.calendarItemWithIdentifier_(reminder_id)
+    if item is None:
+        raise ValueError(f"Reminder not found: {reminder_id!r}")
+    return item
+
+
+def _serialize_reminder(r) -> dict:  # noqa: ANN001
+    url = r.URL()
+    return {
+        "reminder_id": r.calendarItemIdentifier(),
+        "title": r.title(),
+        "list": r.calendar().title() if r.calendar() else None,
+        "list_id": r.calendar().calendarIdentifier() if r.calendar() else None,
+        "due": _from_due_components(r.dueDateComponents()),
+        "completed": bool(r.isCompleted()),
+        "completion_date": _from_nsdate(r.completionDate()),
+        "priority": _priority_from_int(r.priority()),
+        "notes": r.notes(),
+        "url": url.absoluteString() if url else None,
+        "is_recurring": bool(r.hasRecurrenceRules()),
+        "recurrence": _summarize_rules(r.recurrenceRules()),
+    }
+
+
+def _save_reminder(r) -> None:  # noqa: ANN001
+    ok, err = _store.saveReminder_commit_error_(r, True, None)
+    if not ok:
+        raise RuntimeError(
+            f"Reminder save failed: "
+            f"{err.localizedDescription() if err else 'unknown error'}"
+        )
+
+
+def _remove_reminder(r) -> None:  # noqa: ANN001
+    ok, err = _store.removeReminder_commit_error_(r, True, None)
+    if not ok:
+        raise RuntimeError(
+            f"Reminder delete failed: "
+            f"{err.localizedDescription() if err else 'unknown error'}"
+        )
+
+
+@mcp.tool()
+def list_reminder_lists() -> list:
+    """List all reminder lists (id, title, color, writable, default)."""
+    _ensure_reminders_access()
+    default = _store.defaultCalendarForNewReminders()
+    default_id = default.calendarIdentifier() if default else None
+    return [
+        {
+            "list_id": c.calendarIdentifier(),
+            "title": c.title(),
+            "color": _hex_from_calendar(c),
+            "writable": bool(c.allowsContentModifications()),
+            "is_default": c.calendarIdentifier() == default_id,
+        }
+        for c in _store.calendarsForEntityType_(EK_ENTITY_REMINDER)
+    ]
+
+
+@mcp.tool()
+def list_reminders(
+    list_id: Optional[str] = None,
+    include_completed: bool = False,
+    due_before: Optional[str] = None,
+    due_after: Optional[str] = None,
+    query: Optional[str] = None,
+) -> list:
+    """List reminders, optionally filtered.
+
+    Args:
+        list_id: Restrict to one reminder list (id or title). Default: all lists.
+        include_completed: Include completed reminders (default: incomplete only).
+        due_before / due_after: ISO datetimes bounding the due date.
+        query: Case-insensitive substring filter on title/notes.
+    """
+    _ensure_reminders_access()
+    cals = [_resolve_reminder_list(list_id)] if list_id else None
+    if include_completed:
+        items = _fetch_reminders(_store.predicateForRemindersInCalendars_(cals))
+    else:
+        start = _to_nsdate(due_after) if due_after else None
+        end = _to_nsdate(due_before) if due_before else None
+        items = _fetch_reminders(
+            _store.predicateForIncompleteRemindersWithDueDateStarting_ending_calendars_(
+                start, end, cals
+            )
+        )
+    out = [_serialize_reminder(r) for r in items]
+    if include_completed and (due_before or due_after):
+        lo = due_after or ""
+        hi = due_before or "9999"
+        out = [r for r in out if r["due"] and lo <= r["due"] <= hi]
+    if query:
+        q = query.lower()
+        out = [
+            r for r in out
+            if q in " ".join(str(r.get(k) or "") for k in ("title", "notes")).lower()
+        ]
+    out.sort(key=lambda r: r["due"] or "9999")
+    return out
+
+
+@mcp.tool()
+def get_reminder(reminder_id: str) -> dict:
+    """Fetch full detail for a single reminder."""
+    _ensure_reminders_access()
+    return _serialize_reminder(_get_reminder(reminder_id))
+
+
+@mcp.tool()
+def create_reminder(
+    title: str,
+    list_id: Optional[str] = None,
+    due: Optional[str] = None,
+    notes: Optional[str] = None,
+    priority: Optional[str] = None,
+    url: Optional[str] = None,
+    recurrence: Optional[dict] = None,
+) -> dict:
+    """Create a reminder and return it.
+
+    Args:
+        title: Reminder title.
+        list_id: Target reminder list (id or title). Default: your default list.
+        due: Optional ISO due date/datetime ('2026-08-10' = no time-of-day).
+        notes: Optional notes.
+        priority: none | low | medium | high.
+        url: Optional URL to attach.
+        recurrence: Optional recurrence spec (same shape as events);
+            requires a due date to anchor the series.
+    """
+    _ensure_reminders_access()
+    r = EventKit.EKReminder.reminderWithEventStore_(_store)
+    r.setCalendar_(_resolve_reminder_list(list_id))
+    r.setTitle_(title)
+    if due is not None:
+        r.setDueDateComponents_(_to_due_components(due))
+    if notes is not None:
+        r.setNotes_(notes or None)
+    if priority is not None:
+        r.setPriority_(_priority_to_int(priority))
+    if url is not None:
+        r.setURL_(NSURL.URLWithString_(url) if url else None)
+    if recurrence:
+        r.addRecurrenceRule_(_build_rule(recurrence))
+    _save_reminder(r)
+    return _serialize_reminder(r)
+
+
+@mcp.tool()
+def update_reminder(
+    reminder_id: str,
+    title: Optional[str] = None,
+    due: Optional[str] = None,
+    notes: Optional[str] = None,
+    priority: Optional[str] = None,
+    url: Optional[str] = None,
+    list_id: Optional[str] = None,
+    completed: Optional[bool] = None,
+    clear_due: bool = False,
+    recurrence: Optional[dict] = None,
+    clear_recurrence: bool = False,
+) -> dict:
+    """Update a reminder. Only the fields you pass are changed.
+
+    Set completed=True to mark it done (False to reopen). clear_due=True removes
+    the due date. Pass empty strings ('') to clear notes/url. Change how it
+    repeats with a new `recurrence` spec, or clear_recurrence=True for a one-off.
+    """
+    _ensure_reminders_access()
+    r = _get_reminder(reminder_id)
+    if title is not None:
+        r.setTitle_(title)
+    if clear_due:
+        r.setDueDateComponents_(None)
+    elif due is not None:
+        r.setDueDateComponents_(_to_due_components(due))
+    if notes is not None:
+        r.setNotes_(notes or None)
+    if priority is not None:
+        r.setPriority_(_priority_to_int(priority))
+    if url is not None:
+        r.setURL_(NSURL.URLWithString_(url) if url else None)
+    if list_id is not None:
+        r.setCalendar_(_resolve_reminder_list(list_id))
+    if completed is not None:
+        r.setCompleted_(bool(completed))
+    if clear_recurrence:
+        r.setRecurrenceRules_(None)
+    elif recurrence is not None:
+        r.setRecurrenceRules_([_build_rule(recurrence)])
+    _save_reminder(r)
+    return _serialize_reminder(r)
+
+
+@mcp.tool()
+def delete_reminder(reminder_id: str) -> dict:
+    """Permanently delete a reminder."""
+    _ensure_reminders_access()
+    _remove_reminder(_get_reminder(reminder_id))
+    return {"deleted": True, "reminder_id": reminder_id}
 
 
 if __name__ == "__main__":
